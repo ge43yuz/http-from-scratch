@@ -67,7 +67,6 @@ func HandleConnection(conn net.Conn, mux http.Handler) error {
 			return nil
 		}
 
-
 		if strings.EqualFold(req.Header.Get("Expect"), "100-continue") {
 			_, _ = conn.Write([]byte("HTTP/1.1 100 Continue\r\n\r\n"))
 		}
