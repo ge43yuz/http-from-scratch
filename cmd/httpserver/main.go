@@ -1,104 +1,187 @@
 package main
 
 import (
+	"encoding/json"
+	"fmt"
 	"httpServer/internal/http1"
 	"httpServer/internal/router"
+	"httpServer/internal/telemetry"
+	"io"
+	"log"
+	"math/rand/v2"
 	"net/http"
-	"slices"
 	"strconv"
-	"strings"
+	"sync"
+
+	"github.com/VictoriaMetrics/metrics"
 )
 
 const addr = ":8080"
 
 func main() {
-	/*
-		http.HandleFunc("/hello", func(w http.ResponseWriter, r *http.Request) {
-			body := "hello"
-			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(body))
-		})
+	r := router.NewCustomMux()
+	userRepo := NewUserRepo()
 
-		customMux := router.NewCustomMux()
-		fmt.Printf("HTTP server listening on %s...\n", addr)
-		if err := http1.ListenAndServe(addr, customMux); err != nil {
-			log.Fatalf("Server error: %v", err)
-		}
-	*/
-	a := NewUserRepo()
-	a.addUser(1, 13, "User1")
-	a.addUser(5, 13, "User2")
-	a.addUser(9, 13, "User3")
-	a.addUser(4, 13, "User4")
-	a.addUser(2, 13, "User5")
-	a.addUser(6, 13, "User6")
-	customMux := router.NewCustomMux()
-	customMux.Handle(http.MethodGet, "/users", a)
-	customMux.Handle(http.MethodPost, "/users", a)
 
-	err := http1.ListenAndServe(addr, customMux)
-	if err != nil {
-		return
+	r.Handle(http.MethodGet, "/users", userRepo)
+	r.Handle(http.MethodPost, "/users", userRepo)
+
+
+	r.HandleFunc(http.MethodGet, "/health", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+	})
+
+
+	r.HandleFunc(http.MethodGet, "/metrics", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		metrics.WriteProcessMetrics(w)
+		metrics.WritePrometheus(w, true)
+	})
+
+
+
+	handlerWithTelemetry := telemetry.Middleware(r)
+
+	fmt.Printf("HTTP server listening on %s...\n", addr)
+	if err := http1.ListenAndServe(addr, handlerWithTelemetry); err != nil {
+		log.Fatalf("Server error: %v", err)
 	}
-
 }
 
 type User struct {
-	id   uint
-	age  uint
-	name string
-}
-
-func NewUser(id uint, name string, age uint) *User {
-	return &User{id: id, name: name, age: age}
+	ID   uint   `json:"id"`
+	Age  uint   `json:"age"`
+	Name string `json:"name"`
 }
 
 type UserRepo struct {
+	mu    sync.RWMutex
 	users []*User
+	gauge *metrics.Gauge
 }
 
 func NewUserRepo() *UserRepo {
-	return &UserRepo{users: make([]*User, 0)}
+	repo := &UserRepo{
+		users: make([]*User, 0),
+		gauge: metrics.NewGauge("app_users_total", nil),
+	}
+
+	repo.addUser(1, 24, "Alice")
+	repo.addUser(2, 30, "Bob")
+	return repo
 }
 
-func (u *UserRepo) addUser(id uint, age uint, name string) {
-	userToAdd := NewUser(id, name, age)
-	if slices.Contains(u.users, userToAdd) {
-		return
+func (u *UserRepo) addUser(id uint, age uint, name string) bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	for _, user := range u.users {
+		if user.ID == id {
+			return false
+		}
 	}
-	u.users = append(u.users, userToAdd)
+	u.users = append(u.users, &User{ID: id, Age: age, Name: name})
+	u.gauge.Set(float64(len(u.users)))
+	return true
 }
-func (u *UserRepo) getUsers(request *http.Request) string {
-	if request.URL.RawQuery != "" {
-		for i := range u.users {
-			if strconv.Itoa(int(u.users[i].id)) == request.URL.RawQuery {
-				var tmp strings.Builder
-				tmp.WriteString(u.users[i].name)
-				tmp.WriteString(" ")
-				return tmp.String()
-			}
+
+func (u *UserRepo) getUsers(queryID string) []*User {
+	u.mu.RLock()
+	defer u.mu.RUnlock()
+
+	if queryID == "" {
+		result := make([]*User, len(u.users))
+		copy(result, u.users)
+		return result
+	}
+
+	id, err := strconv.ParseUint(queryID, 10, 64)
+	if err != nil {
+		return []*User{}
+	}
+
+	for _, user := range u.users {
+		if user.ID == uint(id) {
+			return []*User{user}
+		}
+	}
+	return []*User{}
+}
+
+func (u *UserRepo) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	switch r.Method {
+	case http.MethodGet:
+		idParam := r.URL.Query().Get("id")
+
+
+		_, fetchSpan := telemetry.StartSpan(r.Context(), "db.fetch_users")
+		fetchSpan.SetAttribute("db.operation", "SELECT")
+		fetchSpan.SetAttribute("query.filter_id", idParam)
+
+
+		users := u.getUsers(idParam)
+		fetchSpan.SetAttribute("results.count", strconv.Itoa(len(users)))
+		fetchSpan.End()
+
+
+		telemetry.Logger.Info("users_queried",
+			"trace_id", r.Context().Value(telemetry.TraceIDKey),
+			"filter_id", idParam,
+			"results_count", len(users),
+		)
+
+		_ = json.NewEncoder(w).Encode(users)
+
+	case http.MethodPost:
+		body, err := io.ReadAll(r.Body)
+		if err != nil || len(body) == 0 {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "empty or invalid request body"})
+			return
 		}
 
-	}
-	var tmp strings.Builder
+		ctx, parseSpan := telemetry.StartSpan(r.Context(), "app.parse_payload")
+		var payload struct {
+			Age  uint   `json:"age"`
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal(body, &payload); err != nil {
+			parseSpan.SetError()
+			parseSpan.End()
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid json"})
+			return
+		}
+		parseSpan.End()
 
-	for i := range u.users {
-		tmp.WriteString(u.users[i].name)
-	}
-	return tmp.String()
-}
 
-func (u UserRepo) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
-	writer.Header().Set("Content-Type", "text/plain")
-	writer.WriteHeader(http.StatusOK)
+		_, insertSpan := telemetry.StartSpan(ctx, "db.insert_user")
+		insertSpan.SetAttribute("db.operation", "INSERT")
+		insertSpan.SetAttribute("user.name", payload.Name)
+		insertSpan.SetAttribute("user.age", strconv.FormatUint(uint64(payload.Age), 10))
 
-	switch request.Method {
-	case http.MethodGet:
-		writer.Write([]byte(u.getUsers(request)))
-	case http.MethodPost:
-		//bodyBytes, _ := io.ReadAll(request.Body)
-		//u.setName(string(bodyBytes))
-		//writer.Write([]byte(u.getUser(request)))
+
+		newID := uint(rand.UintN(10000) + 10)
+		u.addUser(newID, payload.Age, payload.Name)
+		insertSpan.SetAttribute("user.id", strconv.FormatUint(uint64(newID), 10))
+		insertSpan.End()
+
+
+		telemetry.Logger.Info("user_registered",
+			"trace_id", r.Context().Value(telemetry.TraceIDKey),
+			"user_id", newID,
+			"name", payload.Name,
+			"age", payload.Age,
+		)
+
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "created", "id": newID})
+
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
 }

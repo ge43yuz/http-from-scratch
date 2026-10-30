@@ -44,6 +44,8 @@ func (c CustomMux) ServeHTTP(writer http.ResponseWriter, request *http.Request) 
 	if a != nil {
 		a(writer, request)
 	} else {
-		fmt.Println("path is not defined", request.URL.Path)
+		writer.Header().Set("Content-Type", "text/plain")
+		writer.WriteHeader(http.StatusNotFound)
+		fmt.Fprintf(writer, "404 page not found: %s\n", request.URL.Path)
 	}
 }

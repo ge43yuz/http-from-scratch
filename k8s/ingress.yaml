@@ -1,0 +1,20 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+
+metadata:
+  name: go-http
+  namespace: apps
+
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: go.localhost
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: go-http
+                port:
+                  number: 8080

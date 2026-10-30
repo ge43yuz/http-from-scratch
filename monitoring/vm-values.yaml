@@ -1,0 +1,37 @@
+vmsingle:
+  enabled: true
+  spec:
+    retentionPeriod: "2d"
+    storage: null
+
+vmagent:
+  enabled: true
+  spec:
+    selectAllByDefault: true
+    scrapeInterval: 10s
+
+vlsingle:
+  enabled: true
+  spec:
+    retentionPeriod: "2d"
+    storage: null
+
+vlagent:
+  enabled: true
+  spec:
+    k8sCollector:
+      enabled: true
+
+vtsingle:
+  enabled: true
+  spec:
+    retentionPeriod: "2d"
+    storage: null
+
+grafana:
+  enabled: true
+  persistence:
+    enabled: false
+
+vmalert:
+  enabled: false

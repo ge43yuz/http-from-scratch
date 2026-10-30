@@ -1,0 +1,13 @@
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMServiceScrape
+metadata:
+  name: go-http
+  namespace: apps
+spec:
+  selector:
+    matchLabels:
+      app: go-http
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 10s
